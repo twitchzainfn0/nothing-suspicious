@@ -40,6 +40,16 @@ app.use((req, res, next) => {
 // Function to check if a user is authorized for a specific license
 async function checkUserLicense(licenseKey, username) {
   try {
+    // First check if license is paused
+    const licenseCheck = await pool.query(
+      'SELECT license_key FROM paused_licenses WHERE license_key = $1',
+      [licenseKey]
+    );
+    
+    if (licenseCheck.rows.length > 0) {
+      return false; // License is paused
+    }
+    
     const result = await pool.query(
       `SELECT 
         CASE 
@@ -63,19 +73,23 @@ async function checkUserLicense(licenseKey, username) {
   }
 }
 
-// NEW: Function to check if user is authorized for a specific vehicle across all licenses
+// Function to check if user is authorized for a specific vehicle across all licenses
 async function checkUserVehicleAuthorization(username, vehicleName) {
   try {
     const result = await pool.query(
       `SELECT 
         CASE 
           WHEN EXISTS (
-            SELECT 1 FROM authorized_users 
-            WHERE username = $1 AND vehicle = '*ALL*'
+            SELECT 1 FROM authorized_users au
+            JOIN licenses l ON au.license_key = l.license_key
+            LEFT JOIN paused_licenses pl ON l.license_key = pl.license_key
+            WHERE au.username = $1 AND au.vehicle = '*ALL*' AND pl.license_key IS NULL
           ) THEN true
           WHEN EXISTS (
-            SELECT 1 FROM authorized_users 
-            WHERE username = $1 AND vehicle = $2
+            SELECT 1 FROM authorized_users au
+            JOIN licenses l ON au.license_key = l.license_key
+            LEFT JOIN paused_licenses pl ON l.license_key = pl.license_key
+            WHERE au.username = $1 AND au.vehicle = $2 AND pl.license_key IS NULL
           ) THEN true
           ELSE false
         END as is_authorized`,
@@ -204,7 +218,7 @@ app.get('/check-user-license/:licenseKey/:username', async (req, res) => {
   }
 });
 
-// NEW: Endpoint for vehicle-specific authorization (no license key required)
+// Endpoint for vehicle-specific authorization (no license key required)
 app.get('/check-user-vehicle/:username/:vehicle', async (req, res) => {
   const { username, vehicle } = req.params;
   
@@ -289,6 +303,26 @@ app.get('/admin/license-users/:licenseKey', async (req, res) => {
     users: licenseUsers, 
     count: licenseUsers.length 
   });
+});
+
+// Endpoint to list all paused licenses
+app.get('/admin/paused-licenses', async (req, res) => {
+  const { adminKey } = req.query;
+  
+  if (adminKey !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const result = await pool.query('SELECT * FROM paused_licenses ORDER BY paused_at DESC');
+    res.json({ 
+      licenses: result.rows, 
+      count: result.rows.length 
+    });
+  } catch (error) {
+    console.error('Error getting paused licenses:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Health check endpoint
