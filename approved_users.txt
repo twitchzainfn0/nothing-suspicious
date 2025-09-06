@@ -1,0 +1,7 @@
+# Approved Users List
+# Add one username per line
+# Lines starting with # are comments and will be ignored
+# Example:
+# YourUsername
+# AnotherUser
+Zainshah786
