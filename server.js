@@ -63,6 +63,32 @@ async function checkUserLicense(licenseKey, username) {
   }
 }
 
+// NEW: Function to check if user is authorized for a specific vehicle across all licenses
+async function checkUserVehicleAuthorization(username, vehicleName) {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        CASE 
+          WHEN EXISTS (
+            SELECT 1 FROM authorized_users 
+            WHERE username = $1 AND vehicle = '*ALL*'
+          ) THEN true
+          WHEN EXISTS (
+            SELECT 1 FROM authorized_users 
+            WHERE username = $1 AND vehicle = $2
+          ) THEN true
+          ELSE false
+        END as is_authorized`,
+      [username, vehicleName]
+    );
+    
+    return result.rows[0].is_authorized;
+  } catch (error) {
+    console.error('Error checking user vehicle authorization:', error);
+    return false;
+  }
+}
+
 // Function to get all users for a specific license
 async function getUsersForLicense(licenseKey) {
   try {
@@ -178,6 +204,33 @@ app.get('/check-user-license/:licenseKey/:username', async (req, res) => {
   }
 });
 
+// NEW: Endpoint for vehicle-specific authorization (no license key required)
+app.get('/check-user-vehicle/:username/:vehicle', async (req, res) => {
+  const { username, vehicle } = req.params;
+  
+  if (!username || !vehicle) {
+    return res.status(400).json({ error: 'Username and vehicle are required' });
+  }
+  
+  try {
+    const isApproved = await checkUserVehicleAuthorization(username, vehicle);
+    
+    res.json({
+      username,
+      vehicle,
+      approved: isApproved,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Log the check for monitoring
+    console.log(`Vehicle check: ${username} - ${vehicle} - ${isApproved ? 'APPROVED' : 'DENIED'}`);
+    
+  } catch (error) {
+    console.error('Error checking user vehicle authorization:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Admin endpoint to add user to a license
 app.post('/admin/add-user-license', async (req, res) => {
   const { licenseKey, username, vehicle, adminKey } = req.body;
@@ -267,7 +320,8 @@ app.get('/', (req, res) => {
     version: '1.0.0',
     endpoints: {
       health: '/health',
-      checkUserLicense: '/check-user-license/:licenseKey/:username'
+      checkUserLicense: '/check-user-license/:licenseKey/:username',
+      checkUserVehicle: '/check-user-vehicle/:username/:vehicle'
     }
   });
 });
@@ -288,6 +342,7 @@ app.listen(PORT, () => {
   console.log(`✅ Anti-leak API server running on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 License endpoint: http://localhost:${PORT}/check-user-license/{licenseKey}/{username}`);
+  console.log(`🔗 Vehicle endpoint: http://localhost:${PORT}/check-user-vehicle/{username}/{vehicle}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
