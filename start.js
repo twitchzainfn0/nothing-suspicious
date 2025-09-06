@@ -1,10 +1,11 @@
 const { spawn } = require('child_process');
+const { execSync } = require('child_process');
 require('dotenv').config();
 
 console.log('Starting Roblox Anti-Leak System...');
 
 // Verify required environment variables
-const requiredEnvVars = ['DISCORD_TOKEN', 'BOT_OWNER_ID'];
+const requiredEnvVars = ['DISCORD_TOKEN', 'BOT_OWNER_ID', 'DATABASE_URL'];
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
 if (missingVars.length > 0) {
@@ -14,6 +15,17 @@ if (missingVars.length > 0) {
 }
 
 console.log('✅ Environment variables verified');
+
+// Check if dependencies are installed
+try {
+    console.log('📦 Checking dependencies...');
+    // Check for pg package
+    require.resolve('pg');
+    console.log('✅ Dependencies verified');
+} catch (error) {
+    console.error('❌ Missing dependencies. Please run: npm install pg');
+    process.exit(1);
+}
 
 // Start the API server first
 console.log('🚀 Starting API server...');
