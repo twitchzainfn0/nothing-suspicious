@@ -41,6 +41,16 @@ async function initializeDatabase() {
             )
         `);
 
+        // Create paused_licenses table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS paused_licenses (
+                license_key VARCHAR(255) PRIMARY KEY REFERENCES licenses(license_key) ON DELETE CASCADE,
+                owner_id VARCHAR(255) NOT NULL,
+                owner_tag VARCHAR(255) NOT NULL,
+                paused_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
+
         logger.info('Database tables initialized');
     } catch (error) {
         logger.error('Error initializing database:', error);
@@ -122,24 +132,16 @@ async function addUserToLicense(licenseKey, username, vehicle = null) {
             return { success: false, message: 'User already has access to all vehicles' };
         }
         
-        // If adding all vehicles, remove any specific vehicle entries
-        if (actualVehicle === ALL_VEHICLES) {
-            await client.query(
-                'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2',
-                [licenseKey, username]
-            );
-        } else {
-            // Check if user already has this specific vehicle
-            const specificCheck = await client.query(
-                'SELECT id FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
-                [licenseKey, username, actualVehicle]
-            );
-            
-            if (specificCheck.rows.length > 0) {
-                await client.query('ROLLBACK');
-                logger.warn(`User ${username} already has vehicle ${actualVehicle} in license ${licenseKey}`);
-                return { success: false, message: 'User already has this vehicle' };
-            }
+        // Check if user already has this specific vehicle
+        const specificCheck = await client.query(
+            'SELECT id FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
+            [licenseKey, username, actualVehicle]
+        );
+        
+        if (specificCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            logger.warn(`User ${username} already has vehicle ${actualVehicle} in license ${licenseKey}`);
+            return { success: false, message: 'User already has this vehicle' };
         }
         
         // Add the new authorization
@@ -208,6 +210,84 @@ async function removeUserFromLicense(licenseKey, username, vehicle = null) {
     }
 }
 
+// Pause license functions
+async function pauseLicense(licenseKey, ownerId, ownerTag) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // Check if license exists
+        const licenseCheck = await client.query(
+            'SELECT license_key FROM licenses WHERE license_key = $1',
+            [licenseKey]
+        );
+        
+        if (licenseCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return { success: false, message: 'License not found' };
+        }
+        
+        // Check if already paused
+        const pauseCheck = await client.query(
+            'SELECT license_key FROM paused_licenses WHERE license_key = $1',
+            [licenseKey]
+        );
+        
+        if (pauseCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return { success: false, message: 'License is already paused' };
+        }
+        
+        // Add to paused licenses
+        await client.query(
+            'INSERT INTO paused_licenses (license_key, owner_id, owner_tag) VALUES ($1, $2, $3)',
+            [licenseKey, ownerId, ownerTag]
+        );
+        
+        await client.query('COMMIT');
+        logger.info(`License paused: ${licenseKey}`);
+        return { success: true, message: 'License paused successfully' };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        logger.error('Error pausing license:', error);
+        return { success: false, message: 'Error pausing license' };
+    } finally {
+        client.release();
+    }
+}
+
+async function unpauseLicense(licenseKey) {
+    try {
+        const result = await pool.query(
+            'DELETE FROM paused_licenses WHERE license_key = $1',
+            [licenseKey]
+        );
+        
+        if (result.rowCount === 0) {
+            return { success: false, message: 'License is not paused or does not exist' };
+        }
+        
+        logger.info(`License unpaused: ${licenseKey}`);
+        return { success: true, message: 'License unpaused successfully' };
+    } catch (error) {
+        logger.error('Error unpausing license:', error);
+        return { success: false, message: 'Error unpausing license' };
+    }
+}
+
+async function isLicensePaused(licenseKey) {
+    try {
+        const result = await pool.query(
+            'SELECT license_key FROM paused_licenses WHERE license_key = $1',
+            [licenseKey]
+        );
+        return result.rows.length > 0;
+    } catch (error) {
+        logger.error('Error checking license pause status:', error);
+        return false;
+    }
+}
+
 // Utility function to get user's license key
 async function getUserLicense(userId) {
     try {
@@ -222,7 +302,7 @@ async function getUserLicense(userId) {
     }
 }
 
-// Command definitions remain the same as before
+// Command definitions
 const commands = [
     new SlashCommandBuilder()
         .setName('createlicense')
@@ -274,6 +354,22 @@ const commands = [
         .addStringOption(option =>
             option.setName('licensekey')
                 .setDescription('License key to delete')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('pauselicense')
+        .setDescription('Pause a license (Bot Owner Only)')
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('User whose license to pause')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('unpauselicense')
+        .setDescription('Unpause a license (Bot Owner Only)')
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('User whose license to unpause')
                 .setRequired(true))
 ];
 
@@ -300,7 +396,7 @@ client.once('ready', async () => {
     }
 });
 
-// Interaction handling remains mostly the same, just using the new database functions
+// Interaction handling
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
@@ -352,6 +448,13 @@ client.on('interactionCreate', async interaction => {
                     return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
                 }
 
+                // Check if license is paused
+                const isPausedAuth = await isLicensePaused(userLicense);
+                if (isPausedAuth) {
+                    logger.warn(`User ${user.tag} attempted to authorize with paused license ${userLicense}`);
+                    return interaction.reply({ content: 'Your license is currently paused. Contact the bot owner.', ephemeral: true });
+                }
+
                 const usernameToAdd = interaction.options.getString('username');
                 const vehicleToAdd = interaction.options.getString('vehicle');
 
@@ -377,6 +480,13 @@ client.on('interactionCreate', async interaction => {
                 if (!userLicense2) {
                     logger.warn(`User ${user.tag} attempted to deauthorize without a license`);
                     return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
+                }
+
+                // Check if license is paused
+                const isPausedDeauth = await isLicensePaused(userLicense2);
+                if (isPausedDeauth) {
+                    logger.warn(`User ${user.tag} attempted to deauthorize with paused license ${userLicense2}`);
+                    return interaction.reply({ content: 'Your license is currently paused. Contact the bot owner.', ephemeral: true });
                 }
 
                 const usernameToRemove = interaction.options.getString('username');
@@ -407,6 +517,8 @@ client.on('interactionCreate', async interaction => {
                     return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
                 }
 
+                // Check if license is paused
+                const isPausedView = await isLicensePaused(userLicense3);
                 const authorizedUsers = await getUsersForLicense(userLicense3);
                 
                 // Group users with their vehicles
@@ -431,9 +543,10 @@ client.on('interactionCreate', async interaction => {
 
                 const embed = new EmbedBuilder()
                     .setTitle('Authorized Users')
-                    .setColor(0x0099ff)
+                    .setColor(isPausedView ? 0xff9900 : 0x0099ff)
                     .addFields(
                         { name: 'License', value: userLicense3, inline: true },
+                        { name: 'Status', value: isPausedView ? '⏸️ PAUSED' : '✅ ACTIVE', inline: true },
                         { name: 'Total Users', value: totalUsers.toString(), inline: true },
                         { name: 'Total Authorizations', value: totalAuthorizations.toString(), inline: true },
                         { name: 'Users & Vehicles', value: userList, inline: false }
@@ -449,15 +562,18 @@ client.on('interactionCreate', async interaction => {
                     return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
                 }
 
+                // Check if license is paused
+                const isPausedMy = await isLicensePaused(myLicense);
                 const myUsers = await getUsersForLicense(myLicense);
                 const myUserCount = new Set(myUsers.map(u => u.username)).size;
                 const myAuthorizationCount = myUsers.length;
 
                 const embed4 = new EmbedBuilder()
                     .setTitle('Your License Information')
-                    .setColor(0x0099ff)
+                    .setColor(isPausedMy ? 0xff9900 : 0x0099ff)
                     .addFields(
                         { name: 'License Key', value: myLicense, inline: true },
+                        { name: 'Status', value: isPausedMy ? '⏸️ PAUSED' : '✅ ACTIVE', inline: true },
                         { name: 'Authorized Users', value: myUserCount.toString(), inline: true },
                         { name: 'Total Authorizations', value: myAuthorizationCount.toString(), inline: true }
                     );
@@ -492,6 +608,56 @@ client.on('interactionCreate', async interaction => {
                 } else {
                     logger.error(`Failed to delete license: ${keyToDelete}`);
                     await interaction.reply({ content: 'Failed to delete license!', ephemeral: true });
+                }
+                break;
+
+            case 'pauselicense':
+                if (user.id !== process.env.BOT_OWNER_ID) {
+                    logger.warn(`Unauthorized license pause attempt by ${user.tag}`);
+                    return interaction.reply({ content: 'Only the bot owner can pause licenses!', ephemeral: true });
+                }
+
+                const userToPause = interaction.options.getUser('user');
+                const userLicenseToPause = await getUserLicense(userToPause.id);
+                
+                if (!userLicenseToPause) {
+                    logger.warn(`License pause failed: User ${userToPause.tag} does not have a license`);
+                    return interaction.reply({ content: 'This user does not have a license!', ephemeral: true });
+                }
+
+                const pauseResult = await pauseLicense(userLicenseToPause, userToPause.id, userToPause.tag);
+
+                if (pauseResult.success) {
+                    logger.info(`License paused: ${userLicenseToPause} for user ${userToPause.tag}`);
+                    await interaction.reply({ content: `License for ${userToPause.tag} has been paused!` });
+                } else {
+                    logger.error(`Failed to pause license: ${userLicenseToPause}`);
+                    await interaction.reply({ content: pauseResult.message || 'Failed to pause license!', ephemeral: true });
+                }
+                break;
+
+            case 'unpauselicense':
+                if (user.id !== process.env.BOT_OWNER_ID) {
+                    logger.warn(`Unauthorized license unpause attempt by ${user.tag}`);
+                    return interaction.reply({ content: 'Only the bot owner can unpause licenses!', ephemeral: true });
+                }
+
+                const userToUnpause = interaction.options.getUser('user');
+                const userLicenseToUnpause = await getUserLicense(userToUnpause.id);
+                
+                if (!userLicenseToUnpause) {
+                    logger.warn(`License unpause failed: User ${userToUnpause.tag} does not have a license`);
+                    return interaction.reply({ content: 'This user does not have a license!', ephemeral: true });
+                }
+
+                const unpauseResult = await unpauseLicense(userLicenseToUnpause);
+
+                if (unpauseResult.success) {
+                    logger.info(`License unpaused: ${userLicenseToUnpause} for user ${userToUnpause.tag}`);
+                    await interaction.reply({ content: `License for ${userToUnpause.tag} has been unpaused!` });
+                } else {
+                    logger.error(`Failed to unpause license: ${userLicenseToUnpause}`);
+                    await interaction.reply({ content: unpauseResult.message || 'Failed to unpause license!', ephemeral: true });
                 }
                 break;
         }
