@@ -1,13 +1,16 @@
 require('dotenv').config();
 const express = require('express');
-const fs = require('fs').promises;
-const path = require('path');
+const { Pool } = require('pg');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const APPROVED_USERS_FILE = path.join(__dirname, 'approved_users.txt');
-const LICENSES_DIR = path.join(__dirname, 'licenses');
+
+// PostgreSQL connection pool
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 // Ensure required environment variables are set
 if (!process.env.ADMIN_KEY) {
@@ -34,68 +37,117 @@ app.use((req, res, next) => {
   next();
 });
 
-// Function to read approved users from file
-async function getApprovedUsers() {
+// Function to check if a user is authorized for a specific license
+async function checkUserLicense(licenseKey, username) {
   try {
-    const data = await fs.readFile(APPROVED_USERS_FILE, 'utf8');
-    return data.split('\n')
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith('#')); // Remove empty lines and comments
+    const result = await pool.query(
+      `SELECT 
+        CASE 
+          WHEN EXISTS (
+            SELECT 1 FROM authorized_users 
+            WHERE license_key = $1 AND username = $2 AND vehicle = '*ALL*'
+          ) THEN true
+          WHEN EXISTS (
+            SELECT 1 FROM authorized_users 
+            WHERE license_key = $1 AND username = $2
+          ) THEN true
+          ELSE false
+        END as is_authorized`,
+      [licenseKey, username]
+    );
+    
+    return result.rows[0].is_authorized;
   } catch (error) {
-    console.error('Error reading approved users file:', error);
-    return [];
+    console.error('Error checking user license:', error);
+    return false;
   }
 }
 
-// Function to read users for a specific license
+// Function to get all users for a specific license
 async function getUsersForLicense(licenseKey) {
   try {
-    // Sanitize license key to prevent directory traversal
-    const sanitizedLicenseKey = licenseKey.replace(/[^a-zA-Z0-9_-]/g, '');
-    const licenseFile = path.join(LICENSES_DIR, `${sanitizedLicenseKey}.txt`);
-    
-    const data = await fs.readFile(licenseFile, 'utf8');
-    return data.split('\n')
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith('#'));
+    const result = await pool.query(
+      'SELECT username, vehicle FROM authorized_users WHERE license_key = $1',
+      [licenseKey]
+    );
+    return result.rows;
   } catch (error) {
-    // Don't log error if file doesn't exist (normal case)
-    if (error.code !== 'ENOENT') {
-      console.error(`Error reading license file for ${licenseKey}:`, error);
-    }
+    console.error('Error getting users for license:', error);
     return [];
   }
 }
 
-// Function to add user to approved list
-async function addApprovedUser(username) {
+// Function to add user to a license
+async function addUserToLicense(licenseKey, username, vehicle = null) {
+  const client = await pool.connect();
   try {
-    const approvedUsers = await getApprovedUsers();
-    if (!approvedUsers.includes(username)) {
-      await fs.appendFile(APPROVED_USERS_FILE, `\n${username}`);
-      return true;
+    await client.query('BEGIN');
+    
+    const actualVehicle = vehicle === null ? '*ALL*' : vehicle;
+    
+    // Check if user already exists with this vehicle
+    const existingCheck = await client.query(
+      'SELECT id FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
+      [licenseKey, username, actualVehicle]
+    );
+    
+    if (existingCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return false; // User already exists with this vehicle
     }
-    return false; // User already exists
+    
+    // If adding all vehicles, remove any specific vehicle entries
+    if (actualVehicle === '*ALL*') {
+      await client.query(
+        'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2',
+        [licenseKey, username]
+      );
+    }
+    
+    // Add the new authorization
+    await client.query(
+      'INSERT INTO authorized_users (license_key, username, vehicle) VALUES ($1, $2, $3)',
+      [licenseKey, username, actualVehicle]
+    );
+    
+    await client.query('COMMIT');
+    return true;
   } catch (error) {
-    console.error('Error adding user:', error);
+    await client.query('ROLLBACK');
+    console.error('Error adding user to license:', error);
     return false;
+  } finally {
+    client.release();
   }
 }
 
-// Function to remove user from approved list
-async function removeApprovedUser(username) {
+// Function to remove user from a license
+async function removeUserFromLicense(licenseKey, username, vehicle = null) {
+  const client = await pool.connect();
   try {
-    const approvedUsers = await getApprovedUsers();
-    const updatedUsers = approvedUsers.filter(user => user !== username);
+    await client.query('BEGIN');
     
-    if (updatedUsers.length !== approvedUsers.length) {
-      await fs.writeFile(APPROVED_USERS_FILE, updatedUsers.join('\n'));
-      return true;
+    let result;
+    if (vehicle) {
+      result = await client.query(
+        'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
+        [licenseKey, username, vehicle]
+      );
+    } else {
+      result = await client.query(
+        'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2',
+        [licenseKey, username]
+      );
     }
-    return false; // User not found
+    
+    await client.query('COMMIT');
+    return result.rowCount > 0;
   } catch (error) {
-    console.error('Error removing user:', error);
+    await client.query('ROLLBACK');
+    console.error('Error removing user from license:', error);
     return false;
+  } finally {
+    client.release();
   }
 }
 
@@ -108,8 +160,7 @@ app.get('/check-user-license/:licenseKey/:username', async (req, res) => {
   }
   
   try {
-    const approvedUsers = await getUsersForLicense(licenseKey);
-    const isApproved = approvedUsers.includes(username);
+    const isApproved = await checkUserLicense(licenseKey, username);
     
     res.json({
       username,
@@ -127,86 +178,47 @@ app.get('/check-user-license/:licenseKey/:username', async (req, res) => {
   }
 });
 
-// Original endpoint for backwards compatibility
-app.get('/check-user/:username', async (req, res) => {
-  const { username } = req.params;
-  
-  if (!username) {
-    return res.status(400).json({ error: 'Username is required' });
-  }
-  
-  try {
-    const approvedUsers = await getApprovedUsers();
-    const isApproved = approvedUsers.includes(username);
-    
-    res.json({
-      username,
-      approved: isApproved,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Log the check for monitoring
-    console.log(`User check: ${username} - ${isApproved ? 'APPROVED' : 'DENIED'}`);
-    
-  } catch (error) {
-    console.error('Error checking user:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Admin endpoint to add user
-app.post('/admin/add-user', async (req, res) => {
-  const { username, adminKey } = req.body;
+// Admin endpoint to add user to a license
+app.post('/admin/add-user-license', async (req, res) => {
+  const { licenseKey, username, vehicle, adminKey } = req.body;
   
   // Simple admin key check
   if (adminKey !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   
-  if (!username) {
-    return res.status(400).json({ error: 'Username is required' });
+  if (!licenseKey || !username) {
+    return res.status(400).json({ error: 'License key and username are required' });
   }
   
-  const success = await addApprovedUser(username);
+  const success = await addUserToLicense(licenseKey, username, vehicle);
   
   if (success) {
-    res.json({ message: `User ${username} added successfully` });
+    res.json({ message: `User ${username} added to license ${licenseKey} successfully` });
   } else {
     res.status(400).json({ error: 'User already exists or error occurred' });
   }
 });
 
-// Admin endpoint to remove user
-app.post('/admin/remove-user', async (req, res) => {
-  const { username, adminKey } = req.body;
+// Admin endpoint to remove user from a license
+app.post('/admin/remove-user-license', async (req, res) => {
+  const { licenseKey, username, vehicle, adminKey } = req.body;
   
   if (adminKey !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   
-  if (!username) {
-    return res.status(400).json({ error: 'Username is required' });
+  if (!licenseKey || !username) {
+    return res.status(400).json({ error: 'License key and username are required' });
   }
   
-  const success = await removeApprovedUser(username);
+  const success = await removeUserFromLicense(licenseKey, username, vehicle);
   
   if (success) {
-    res.json({ message: `User ${username} removed successfully` });
+    res.json({ message: `User ${username} removed from license ${licenseKey} successfully` });
   } else {
     res.status(400).json({ error: 'User not found or error occurred' });
   }
-});
-
-// Endpoint to list all approved users (admin only)
-app.get('/admin/users', async (req, res) => {
-  const { adminKey } = req.query;
-  
-  if (adminKey !== process.env.ADMIN_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  const approvedUsers = await getApprovedUsers();
-  res.json({ users: approvedUsers, count: approvedUsers.length });
 });
 
 // Endpoint to list users for a specific license
@@ -227,12 +239,25 @@ app.get('/admin/license-users/:licenseKey', async (req, res) => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  });
+app.get('/health', async (req, res) => {
+  try {
+    // Test database connection
+    await pool.query('SELECT 1');
+    res.json({ 
+      status: 'OK', 
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || 'development',
+      database: 'Connected'
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'ERROR', 
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || 'development',
+      database: 'Disconnected',
+      error: error.message
+    });
+  }
 });
 
 // Root endpoint
@@ -242,38 +267,10 @@ app.get('/', (req, res) => {
     version: '1.0.0',
     endpoints: {
       health: '/health',
-      checkUser: '/check-user/:username',
       checkUserLicense: '/check-user-license/:licenseKey/:username'
     }
   });
 });
-
-// Initialize approved users file if it doesn't exist
-async function initializeUsersFile() {
-  try {
-    await fs.access(APPROVED_USERS_FILE);
-  } catch {
-    // File doesn't exist, create it with a comment
-    const initialContent = `# Approved Users List
-# Add one username per line
-# Lines starting with # are comments and will be ignored
-# Example:
-# YourUsername
-# AnotherUser`;
-    await fs.writeFile(APPROVED_USERS_FILE, initialContent);
-    console.log('Created approved_users.txt file');
-  }
-}
-
-// Initialize licenses directory
-async function initializeLicensesDir() {
-  try {
-    await fs.access(LICENSES_DIR);
-  } catch {
-    await fs.mkdir(LICENSES_DIR, { recursive: true });
-    console.log('Created licenses directory');
-  }
-}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -287,9 +284,7 @@ app.use((req, res) => {
 });
 
 // Start server
-app.listen(PORT, async () => {
-  await initializeUsersFile();
-  await initializeLicensesDir();
+app.listen(PORT, () => {
   console.log(`✅ Anti-leak API server running on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 License endpoint: http://localhost:${PORT}/check-user-license/{licenseKey}/{username}`);
