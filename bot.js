@@ -1,6 +1,5 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
-const fs = require('fs').promises;
-const path = require('path');
+const { Pool } = require('pg');
 const logger = require('./logger');
 require('dotenv').config();
 
@@ -8,176 +7,222 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
-// Configuration
-const LICENSES_DIR = path.join(__dirname, 'licenses');
-const LICENSES_FILE = path.join(__dirname, 'licenses.json');
+// PostgreSQL connection pool
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 // Special value for "all vehicles" authorization
 const ALL_VEHICLES = '*ALL*';
 
-// Ensure directories exist
-async function initializeBot() {
+// Initialize database tables
+async function initializeDatabase() {
     try {
-        await fs.access(LICENSES_DIR);
-        logger.info('Licenses directory exists');
-    } catch {
-        await fs.mkdir(LICENSES_DIR, { recursive: true });
-        logger.info('Created licenses directory');
-    }
+        // Create licenses table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS licenses (
+                license_key VARCHAR(255) PRIMARY KEY,
+                owner_id VARCHAR(255) NOT NULL,
+                owner_tag VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
 
-    try {
-        await fs.access(LICENSES_FILE);
-        logger.info('Licenses file exists');
-    } catch {
-        await fs.writeFile(LICENSES_FILE, JSON.stringify({}));
-        logger.info('Created licenses file');
+        // Create authorized_users table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS authorized_users (
+                id SERIAL PRIMARY KEY,
+                license_key VARCHAR(255) REFERENCES licenses(license_key) ON DELETE CASCADE,
+                username VARCHAR(255) NOT NULL,
+                vehicle VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(license_key, username, vehicle)
+            )
+        `);
+
+        logger.info('Database tables initialized');
+    } catch (error) {
+        logger.error('Error initializing database:', error);
+        throw error;
     }
 }
 
 // License management functions
 async function getLicenses() {
     try {
-        const data = await fs.readFile(LICENSES_FILE, 'utf8');
-        return JSON.parse(data);
+        const result = await pool.query('SELECT * FROM licenses');
+        const licenses = {};
+        result.rows.forEach(row => {
+            licenses[row.license_key] = {
+                ownerId: row.owner_id,
+                ownerTag: row.owner_tag,
+                createdAt: row.created_at
+            };
+        });
+        return licenses;
     } catch (error) {
         logger.error('Error reading licenses:', error);
         return {};
     }
 }
 
-async function saveLicenses(licenses) {
+async function createLicense(licenseKey, ownerId, ownerTag) {
     try {
-        await fs.writeFile(LICENSES_FILE, JSON.stringify(licenses, null, 2));
+        await pool.query(
+            'INSERT INTO licenses (license_key, owner_id, owner_tag) VALUES ($1, $2, $3)',
+            [licenseKey, ownerId, ownerTag]
+        );
         return true;
     } catch (error) {
-        logger.error('Error saving licenses:', error);
+        logger.error('Error creating license:', error);
         return false;
     }
 }
 
-// Updated to parse username:vehicle format from TXT files
+async function deleteLicense(licenseKey) {
+    try {
+        await pool.query('DELETE FROM licenses WHERE license_key = $1', [licenseKey]);
+        return true;
+    } catch (error) {
+        logger.error('Error deleting license:', error);
+        return false;
+    }
+}
+
 async function getUsersForLicense(licenseKey) {
     try {
-        const filePath = path.join(LICENSES_DIR, `${licenseKey}.txt`);
-        const data = await fs.readFile(filePath, 'utf8');
-        
-        return data.split('\n')
-            .map(line => line.trim())
-            .filter(line => line && !line.startsWith('#'))
-            .map(line => {
-                // Parse "username:vehicle" format
-                const parts = line.split(':');
-                return {
-                    username: parts[0].trim(),
-                    vehicle: parts[1] ? parts[1].trim() : 'default'
-                };
-            });
+        const result = await pool.query(
+            'SELECT username, vehicle FROM authorized_users WHERE license_key = $1',
+            [licenseKey]
+        );
+        return result.rows;
     } catch (error) {
-        logger.warn(`No users found for license ${licenseKey}`);
+        logger.warn(`No users found for license ${licenseKey}:`, error);
         return [];
     }
 }
 
-// Updated to save in username:vehicle format
-async function saveUsersToLicense(licenseKey, users) {
-    try {
-        const filePath = path.join(LICENSES_DIR, `${licenseKey}.txt`);
-        const content = '# Approved Users List\n# Format: username:vehicle\n# Add one entry per line\n' +
-            users.map(user => `${user.username}:${user.vehicle}`).join('\n');
-        
-        await fs.writeFile(filePath, content);
-        return true;
-    } catch (error) {
-        logger.error('Error saving users to license:', error);
-        return false;
-    }
-}
-
-// Updated to add user with specific vehicle or all vehicles
 async function addUserToLicense(licenseKey, username, vehicle = null) {
+    const client = await pool.connect();
     try {
-        const users = await getUsersForLicense(licenseKey);
+        await client.query('BEGIN');
         
-        if (vehicle === null) {
-            // Authorize for ALL vehicles
-            // Remove any existing specific vehicle entries for this user
-            const filteredUsers = users.filter(u => u.username !== username);
-            filteredUsers.push({ username, vehicle: ALL_VEHICLES });
-            
-            await saveUsersToLicense(licenseKey, filteredUsers);
-            logger.info(`Added user ${username} for ALL vehicles to license ${licenseKey}`);
-            return { success: true, forAllVehicles: true };
+        const actualVehicle = vehicle === null ? ALL_VEHICLES : vehicle;
+        
+        // Check if user already has access to all vehicles
+        const allAccessCheck = await client.query(
+            'SELECT id FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
+            [licenseKey, username, ALL_VEHICLES]
+        );
+        
+        if (allAccessCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            logger.warn(`User ${username} already has access to ALL vehicles in license ${licenseKey}`);
+            return { success: false, message: 'User already has access to all vehicles' };
+        }
+        
+        // If adding all vehicles, remove any specific vehicle entries
+        if (actualVehicle === ALL_VEHICLES) {
+            await client.query(
+                'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2',
+                [licenseKey, username]
+            );
         } else {
-            // Check if user already has access to all vehicles
-            const hasAllAccess = users.some(u => u.username === username && u.vehicle === ALL_VEHICLES);
-            if (hasAllAccess) {
-                logger.warn(`User ${username} already has access to ALL vehicles in license ${licenseKey}`);
-                return { success: false, message: 'User already has access to all vehicles' };
-            }
-            
             // Check if user already has this specific vehicle
-            const hasSpecificVehicle = users.some(u => u.username === username && u.vehicle === vehicle);
-            if (hasSpecificVehicle) {
-                logger.warn(`User ${username} already has vehicle ${vehicle} in license ${licenseKey}`);
+            const specificCheck = await client.query(
+                'SELECT id FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
+                [licenseKey, username, actualVehicle]
+            );
+            
+            if (specificCheck.rows.length > 0) {
+                await client.query('ROLLBACK');
+                logger.warn(`User ${username} already has vehicle ${actualVehicle} in license ${licenseKey}`);
                 return { success: false, message: 'User already has this vehicle' };
             }
-            
-            // Add specific vehicle
-            users.push({ username, vehicle });
-            await saveUsersToLicense(licenseKey, users);
-            
-            logger.info(`Added user ${username} with vehicle ${vehicle} to license ${licenseKey}`);
-            return { success: true, forAllVehicles: false };
         }
+        
+        // Add the new authorization
+        await client.query(
+            'INSERT INTO authorized_users (license_key, username, vehicle) VALUES ($1, $2, $3)',
+            [licenseKey, username, actualVehicle]
+        );
+        
+        await client.query('COMMIT');
+        
+        logger.info(`Added user ${username} with vehicle ${actualVehicle} to license ${licenseKey}`);
+        return { success: true, forAllVehicles: actualVehicle === ALL_VEHICLES };
     } catch (error) {
+        await client.query('ROLLBACK');
         logger.error('Error adding user to license:', error);
         return { success: false, message: 'Error adding user' };
+    } finally {
+        client.release();
     }
 }
 
-// Updated to remove specific vehicle from user or all vehicles
 async function removeUserFromLicense(licenseKey, username, vehicle = null) {
+    const client = await pool.connect();
     try {
-        const users = await getUsersForLicense(licenseKey);
+        await client.query('BEGIN');
         
+        let result;
         if (vehicle) {
             // Remove specific vehicle for user
-            const filteredUsers = users.filter(u => !(u.username === username && u.vehicle === vehicle));
+            result = await client.query(
+                'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2 AND vehicle = $3',
+                [licenseKey, username, vehicle]
+            );
             
-            if (filteredUsers.length === users.length) {
+            if (result.rowCount === 0) {
+                await client.query('ROLLBACK');
                 logger.warn(`Vehicle ${vehicle} not found for user ${username} in license ${licenseKey}`);
                 return false;
             }
             
-            await saveUsersToLicense(licenseKey, filteredUsers);
             logger.info(`Removed vehicle ${vehicle} from user ${username} in license ${licenseKey}`);
-            return true;
         } else {
-            // Remove ALL authorization for user (both specific vehicles and all vehicles)
-            const filteredUsers = users.filter(u => u.username !== username);
+            // Remove ALL authorization for user
+            result = await client.query(
+                'DELETE FROM authorized_users WHERE license_key = $1 AND username = $2',
+                [licenseKey, username]
+            );
             
-            if (filteredUsers.length === users.length) {
+            if (result.rowCount === 0) {
+                await client.query('ROLLBACK');
                 logger.warn(`User ${username} not found in license ${licenseKey}`);
                 return false;
             }
             
-            await saveUsersToLicense(licenseKey, filteredUsers);
             logger.info(`Removed ALL vehicles for user ${username} from license ${licenseKey}`);
-            return true;
         }
+        
+        await client.query('COMMIT');
+        return true;
     } catch (error) {
+        await client.query('ROLLBACK');
         logger.error('Error removing user from license:', error);
         return false;
+    } finally {
+        client.release();
     }
 }
 
 // Utility function to get user's license key
 async function getUserLicense(userId) {
-    const licenses = await getLicenses();
-    return Object.entries(licenses).find(([key, data]) => data.ownerId === userId)?.[0];
+    try {
+        const result = await pool.query(
+            'SELECT license_key FROM licenses WHERE owner_id = $1',
+            [userId]
+        );
+        return result.rows.length > 0 ? result.rows[0].license_key : null;
+    } catch (error) {
+        logger.error('Error getting user license:', error);
+        return null;
+    }
 }
 
-// Command handlers - updated to make vehicle optional
+// Command definitions remain the same as before
 const commands = [
     new SlashCommandBuilder()
         .setName('createlicense')
@@ -235,6 +280,9 @@ const commands = [
 client.once('ready', async () => {
     logger.info(`Bot logged in as ${client.user.tag}`);
     
+    // Initialize database
+    await initializeDatabase();
+    
     // Register slash commands
     try {
         const rest = require('@discordjs/rest');
@@ -250,10 +298,9 @@ client.once('ready', async () => {
     } catch (error) {
         logger.error('Error registering commands:', error);
     }
-
-    await initializeBot();
 });
 
+// Interaction handling remains mostly the same, just using the new database functions
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
@@ -279,22 +326,9 @@ client.on('interactionCreate', async interaction => {
                 // Generate a unique license key
                 const licenseKey = `license_${targetUser.id}_${Date.now()}`;
                 
-                const licenses = await getLicenses();
-
-                licenses[licenseKey] = {
-                    ownerId: targetUser.id,
-                    ownerTag: targetUser.tag,
-                    createdAt: new Date().toISOString()
-                };
-
-                const success = await saveLicenses(licenses);
+                const success = await createLicense(licenseKey, targetUser.id, targetUser.tag);
                 
                 if (success) {
-                    // Create the license file with header
-                    const content = '# Approved Users List\n# Format: username:vehicle\n# Add one entry per line\n';
-                    const filePath = path.join(LICENSES_DIR, `${licenseKey}.txt`);
-                    await fs.writeFile(filePath, content);
-
                     const embed = new EmbedBuilder()
                         .setTitle('License Created Successfully')
                         .setColor(0x00ff00)
@@ -438,25 +472,21 @@ client.on('interactionCreate', async interaction => {
                 }
 
                 const keyToDelete = interaction.options.getString('licensekey');
-                const allLicenses = await getLicenses();
                 
-                if (!allLicenses[keyToDelete]) {
+                // Check if license exists
+                const licenseCheck = await pool.query(
+                    'SELECT license_key FROM licenses WHERE license_key = $1',
+                    [keyToDelete]
+                );
+                
+                if (licenseCheck.rows.length === 0) {
                     logger.warn(`License deletion failed: Key ${keyToDelete} not found`);
                     return interaction.reply({ content: 'License key not found!', ephemeral: true });
                 }
 
-                delete allLicenses[keyToDelete];
-                const deleteSuccess = await saveLicenses(allLicenses);
+                const deleteSuccess = await deleteLicense(keyToDelete);
 
                 if (deleteSuccess) {
-                    // Delete the license file
-                    try {
-                        const filePath = path.join(LICENSES_DIR, `${keyToDelete}.txt`);
-                        await fs.unlink(filePath);
-                    } catch (error) {
-                        logger.error('Error deleting license file:', error);
-                    }
-
                     logger.info(`License deleted: ${keyToDelete}`);
                     await interaction.reply({ content: `License ${keyToDelete} deleted successfully!` });
                 } else {
@@ -478,12 +508,25 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/health', (req, res) => {
-    res.status(200).json({ 
-        status: 'OK', 
-        bot: client.user ? 'Connected' : 'Disconnected',
-        timestamp: new Date().toISOString() 
-    });
+app.get('/health', async (req, res) => {
+    try {
+        // Test database connection
+        await pool.query('SELECT 1');
+        res.status(200).json({ 
+            status: 'OK', 
+            bot: client.user ? 'Connected' : 'Disconnected',
+            database: 'Connected',
+            timestamp: new Date().toISOString() 
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            status: 'ERROR', 
+            bot: client.user ? 'Connected' : 'Disconnected',
+            database: 'Disconnected',
+            error: error.message,
+            timestamp: new Date().toISOString() 
+        });
+    }
 });
 
 app.listen(PORT, () => {
@@ -491,8 +534,9 @@ app.listen(PORT, () => {
 });
 
 // Handle graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     logger.info('Shutting down gracefully...');
+    await pool.end();
     client.destroy();
     process.exit(0);
 });
