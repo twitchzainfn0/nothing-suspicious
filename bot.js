@@ -302,6 +302,52 @@ async function getUserLicense(userId) {
     }
 }
 
+// Function to get license info for a user
+async function getLicenseInfo(userId) {
+    try {
+        // Get the license key
+        const licenseResult = await pool.query(
+            'SELECT license_key, owner_tag, created_at FROM licenses WHERE owner_id = $1',
+            [userId]
+        );
+        
+        if (licenseResult.rows.length === 0) {
+            return null;
+        }
+        
+        const license = licenseResult.rows[0];
+        
+        // Check if license is paused
+        const isPaused = await isLicensePaused(license.license_key);
+        
+        // Get authorized users
+        const authorizedUsers = await getUsersForLicense(license.license_key);
+        
+        // Group users with their vehicles
+        const userVehicles = {};
+        authorizedUsers.forEach(({ username, vehicle }) => {
+            if (!userVehicles[username]) {
+                userVehicles[username] = [];
+            }
+            userVehicles[username].push(vehicle === ALL_VEHICLES ? 'ALL Vehicles' : vehicle);
+        });
+        
+        return {
+            licenseKey: license.license_key,
+            ownerTag: license.owner_tag,
+            ownerId: userId,
+            createdAt: license.created_at,
+            isPaused: isPaused,
+            authorizedUsers: userVehicles,
+            totalUsers: Object.keys(userVehicles).length,
+            totalAuthorizations: authorizedUsers.length
+        };
+    } catch (error) {
+        logger.error('Error getting license info:', error);
+        return null;
+    }
+}
+
 // Command definitions
 const commands = [
     new SlashCommandBuilder()
@@ -370,6 +416,14 @@ const commands = [
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('User whose license to unpause')
+                .setRequired(true)),
+                
+    new SlashCommandBuilder()
+        .setName('licenseinfo')
+        .setDescription('Check license information for a user (Bot Owner Only)')
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('User to check license information for')
                 .setRequired(true))
 ];
 
@@ -659,6 +713,47 @@ client.on('interactionCreate', async interaction => {
                     logger.error(`Failed to unpause license: ${userLicenseToUnpause}`);
                     await interaction.reply({ content: unpauseResult.message || 'Failed to unpause license!', ephemeral: true });
                 }
+                break;
+                
+            case 'licenseinfo':
+                if (user.id !== process.env.BOT_OWNER_ID) {
+                    logger.warn(`Unauthorized license info attempt by ${user.tag}`);
+                    return interaction.reply({ content: 'Only the bot owner can check license information!', ephemeral: true });
+                }
+
+                const targetUserInfo = interaction.options.getUser('user');
+                const licenseInfo = await getLicenseInfo(targetUserInfo.id);
+                
+                if (!licenseInfo) {
+                    logger.warn(`License info not found for user ${targetUserInfo.tag}`);
+                    return interaction.reply({ content: 'This user does not have a license!', ephemeral: true });
+                }
+
+                // Format user list
+                let userListInfo = 'None';
+                if (licenseInfo.totalUsers > 0) {
+                    userListInfo = Object.entries(licenseInfo.authorizedUsers)
+                        .map(([username, vehicles]) => 
+                            `${username}: ${vehicles.join(', ')}`)
+                        .join('\n');
+                }
+
+                const embedInfo = new EmbedBuilder()
+                    .setTitle('License Information')
+                    .setColor(licenseInfo.isPaused ? 0xff9900 : 0x0099ff)
+                    .addFields(
+                        { name: 'License Key', value: licenseInfo.licenseKey, inline: true },
+                        { name: 'Owner', value: licenseInfo.ownerTag, inline: true },
+                        { name: 'Status', value: licenseInfo.isPaused ? '⏸️ PAUSED' : '✅ ACTIVE', inline: true },
+                        { name: 'Created At', value: new Date(licenseInfo.createdAt).toLocaleDateString(), inline: true },
+                        { name: 'Total Users', value: licenseInfo.totalUsers.toString(), inline: true },
+                        { name: 'Total Authorizations', value: licenseInfo.totalAuthorizations.toString(), inline: true },
+                        { name: 'Users & Vehicles', value: userListInfo, inline: false }
+                    )
+                    .setFooter({ text: `User ID: ${targetUserInfo.id}` })
+                    .setTimestamp();
+
+                await interaction.reply({ embeds: [embedInfo] });
                 break;
         }
     } catch (error) {
