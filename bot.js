@@ -4,7 +4,7 @@ const logger = require('./logger');
 require('dotenv').config();
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.DirectMessages]
 });
 
 // PostgreSQL connection pool
@@ -511,6 +511,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('createlicense')
         .setDescription('Create a new license (Bot Owner Only)')
+        .setDMPermission(true)
         .addUserOption(option => 
             option.setName('user')
                 .setDescription('User who will own this license')
@@ -523,6 +524,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('authorize')
         .setDescription('Add a user to approved list')
+        .setDMPermission(true)
         .addStringOption(option =>
             option.setName('username')
                 .setDescription('Roblox username to authorize')
@@ -539,6 +541,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('deauthorize')
         .setDescription('Remove a user/vehicle from approved list')
+        .setDMPermission(true)
         .addStringOption(option =>
             option.setName('username')
                 .setDescription('Roblox username to deauthorize')
@@ -555,6 +558,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('authorized')
         .setDescription('List all authorized users and their vehicles')
+        .setDMPermission(true)
         .addStringOption(option =>
             option.setName('licensekey')
                 .setDescription('License key to view (required if you have multiple staff roles)')
@@ -562,11 +566,13 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('mylicense')
-        .setDescription('Show your license information'),
+        .setDescription('Show your license information')
+        .setDMPermission(true),
 
     new SlashCommandBuilder()
         .setName('deletelicense')
         .setDescription('Delete a license (Bot Owner Only)')
+        .setDMPermission(true)
         .addStringOption(option =>
             option.setName('licensekey')
                 .setDescription('License key to delete')
@@ -575,6 +581,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('pauselicense')
         .setDescription('Pause a license (Bot Owner Only)')
+        .setDMPermission(true)
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('User whose license to pause')
@@ -583,6 +590,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('unpauselicense')
         .setDescription('Unpause a license (Bot Owner Only)')
+        .setDMPermission(true)
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('User whose license to unpause')
@@ -591,6 +599,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('licenseinfo')
         .setDescription('Check license information for a user (Bot Owner Only)')
+        .setDMPermission(true)
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('User to check license information for')
@@ -599,6 +608,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('transferlicense')
         .setDescription('Transfer a license from one user to another (Bot Owner Only)')
+        .setDMPermission(true)
         .addUserOption(option =>
             option.setName('from')
                 .setDescription('Current license owner')
@@ -611,6 +621,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('addstaff')
         .setDescription('Add an admin or helper to manage your license')
+        .setDMPermission(true)
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('User to add as staff')
@@ -627,6 +638,7 @@ const commands = [
     new SlashCommandBuilder()
         .setName('removestaff')
         .setDescription('Remove a staff member from your license')
+        .setDMPermission(true)
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('Staff member to remove')
@@ -634,11 +646,13 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('staff')
-        .setDescription('List all staff members for your license'),
+        .setDescription('List all staff members for your license')
+        .setDMPermission(true),
 
     new SlashCommandBuilder()
         .setName('mystaff')
         .setDescription('Show licenses where you are staff')
+        .setDMPermission(true)
 ];
 
 client.once('ready', async () => {
