@@ -424,6 +424,18 @@ const commands = [
         .addUserOption(option =>
             option.setName('user')
                 .setDescription('User to check license information for')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('transferlicense')
+        .setDescription('Transfer a license from one user to another (Bot Owner Only)')
+        .addUserOption(option =>
+            option.setName('from')
+                .setDescription('Current license owner')
+                .setRequired(true))
+        .addUserOption(option =>
+            option.setName('to')
+                .setDescription('New license owner')
                 .setRequired(true))
 ];
 
@@ -754,6 +766,84 @@ client.on('interactionCreate', async interaction => {
                     .setTimestamp();
 
                 await interaction.reply({ embeds: [embedInfo] });
+                break;
+
+            case 'transferlicense':
+                if (user.id !== process.env.BOT_OWNER_ID) {
+                    logger.warn(`Unauthorized license transfer attempt by ${user.tag}`);
+                    return interaction.reply({ content: 'Only the bot owner can transfer licenses!', ephemeral: true });
+                }
+
+                const fromUser = interaction.options.getUser('from');
+                const toUser = interaction.options.getUser('to');
+
+                // Check if users are the same
+                if (fromUser.id === toUser.id) {
+                    logger.warn(`License transfer failed: Same user specified for from and to`);
+                    return interaction.reply({ content: 'Cannot transfer license to the same user!', ephemeral: true });
+                }
+
+                // Check if old owner has a license
+                const fromUserLicense = await getUserLicense(fromUser.id);
+                if (!fromUserLicense) {
+                    logger.warn(`License transfer failed: User ${fromUser.tag} does not have a license`);
+                    return interaction.reply({ content: `User ${fromUser.tag} does not have a license!`, ephemeral: true });
+                }
+
+                // Check if new owner already has a license
+                const toUserLicense = await getUserLicense(toUser.id);
+                if (toUserLicense) {
+                    logger.warn(`License transfer failed: User ${toUser.tag} already has license ${toUserLicense}`);
+                    return interaction.reply({ content: `User ${toUser.tag} already has a license: ${toUserLicense}`, ephemeral: true });
+                }
+
+                const dbClient = await pool.connect();
+                try {
+                    await dbClient.query('BEGIN');
+
+                    // Update the license owner in licenses table
+                    const updateResult = await dbClient.query(
+                        'UPDATE licenses SET owner_id = $1, owner_tag = $2 WHERE license_key = $3',
+                        [toUser.id, toUser.tag, fromUserLicense]
+                    );
+
+                    if (updateResult.rowCount === 0) {
+                        await dbClient.query('ROLLBACK');
+                        logger.error(`License transfer failed: Could not update license ${fromUserLicense}`);
+                        return interaction.reply({ content: 'Failed to transfer license!', ephemeral: true });
+                    }
+
+                    // Update paused_licenses table if the license is paused
+                    await dbClient.query(
+                        'UPDATE paused_licenses SET owner_id = $1, owner_tag = $2 WHERE license_key = $3',
+                        [toUser.id, toUser.tag, fromUserLicense]
+                    );
+
+                    await dbClient.query('COMMIT');
+
+                    // Log the transfer
+                    logger.info(`License transferred: ${fromUserLicense} from ${fromUser.tag} to ${toUser.tag}`);
+
+                    // Send success embed
+                    const transferEmbed = new EmbedBuilder()
+                        .setTitle('License Transferred Successfully')
+                        .setColor(0x00ff00)
+                        .addFields(
+                            { name: 'License Key', value: fromUserLicense, inline: true },
+                            { name: 'Previous Owner', value: fromUser.tag, inline: true },
+                            { name: 'New Owner', value: toUser.tag, inline: true }
+                        )
+                        .setTimestamp();
+
+                    await interaction.reply({ embeds: [transferEmbed] });
+
+                } catch (error) {
+                    await dbClient.query('ROLLBACK');
+                    logger.error('Error transferring license:', error);
+                    await interaction.reply({ content: 'An error occurred while transferring the license!', ephemeral: true });
+                } finally {
+                    dbClient.release();
+                }
                 break;
         }
     } catch (error) {
