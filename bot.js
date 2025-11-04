@@ -506,6 +506,57 @@ async function canUserManageLicense(userId, licenseKey, requireAdmin = false) {
     }
 }
 
+// NEW FUNCTION: Get all licenses with users and staff
+async function getAllLicensesWithDetails() {
+    try {
+        // Get all licenses
+        const licensesResult = await pool.query(`
+            SELECT l.license_key, l.owner_id, l.owner_tag, l.created_at,
+                   pl.paused_at IS NOT NULL as is_paused
+            FROM licenses l
+            LEFT JOIN paused_licenses pl ON l.license_key = pl.license_key
+            ORDER BY l.created_at DESC
+        `);
+        
+        const licenses = [];
+        
+        for (const license of licensesResult.rows) {
+            // Get authorized users for this license
+            const authorizedUsers = await getUsersForLicense(license.license_key);
+            
+            // Group users with their vehicles
+            const userVehicles = {};
+            authorizedUsers.forEach(({ username, vehicle }) => {
+                if (!userVehicles[username]) {
+                    userVehicles[username] = [];
+                }
+                userVehicles[username].push(vehicle === ALL_VEHICLES ? 'ALL Vehicles' : vehicle);
+            });
+            
+            // Get staff for this license
+            const staffMembers = await getLicenseStaff(license.license_key);
+            
+            licenses.push({
+                licenseKey: license.license_key,
+                ownerId: license.owner_id,
+                ownerTag: license.owner_tag,
+                createdAt: license.created_at,
+                isPaused: license.is_paused,
+                authorizedUsers: userVehicles,
+                staffMembers: staffMembers,
+                totalUsers: Object.keys(userVehicles).length,
+                totalAuthorizations: authorizedUsers.length,
+                totalStaff: staffMembers.length
+            });
+        }
+        
+        return licenses;
+    } catch (error) {
+        logger.error('Error getting all licenses with details:', error);
+        return [];
+    }
+}
+
 // Command definitions
 const commands = [
     new SlashCommandBuilder()
@@ -652,6 +703,12 @@ const commands = [
     new SlashCommandBuilder()
         .setName('mystaff')
         .setDescription('Show licenses where you are staff')
+        .setDMPermission(true),
+
+    // NEW COMMAND: All Users
+    new SlashCommandBuilder()
+        .setName('allusers')
+        .setDescription('Show all licenses with authorized users and staff (Bot Owner Only)')
         .setDMPermission(true)
 ];
 
@@ -1323,6 +1380,116 @@ client.on('interactionCreate', async interaction => {
                     );
 
                 await interaction.reply({ embeds: [myStaffEmbed], ephemeral: true });
+                break;
+
+            // NEW COMMAND: All Users
+            case 'allusers':
+                if (user.id !== process.env.BOT_OWNER_ID) {
+                    logger.warn(`Unauthorized allusers command attempt by ${user.tag}`);
+                    return interaction.reply({ content: 'Only the bot owner can view all users!', ephemeral: true });
+                }
+
+                // Defer the reply since this might take some time
+                await interaction.deferReply();
+
+                const allLicenses = await getAllLicensesWithDetails();
+                
+                if (allLicenses.length === 0) {
+                    return interaction.editReply({ content: 'No licenses found in the system!', ephemeral: true });
+                }
+
+                // Create embeds (multiple if needed due to Discord's embed limits)
+                const embeds = [];
+                let currentEmbed = new EmbedBuilder()
+                    .setTitle('📊 All Licenses Overview')
+                    .setColor(0x0099ff)
+                    .setDescription(`Total Licenses: ${allLicenses.length}\n\nShowing all license owners with their authorized users and staff members.`)
+                    .setTimestamp();
+
+                let fieldCount = 0;
+                const maxFieldsPerEmbed = 25; // Discord limit
+
+                for (const license of allLicenses) {
+                    // Format authorized users
+                    let usersText = 'None';
+                    if (license.totalUsers > 0) {
+                        usersText = Object.entries(license.authorizedUsers)
+                            .slice(0, 5) // Limit to 5 users per license in overview
+                            .map(([username, vehicles]) => 
+                                `• ${username}: ${vehicles.slice(0, 3).join(', ')}${vehicles.length > 3 ? '...' : ''}`
+                            )
+                            .join('\n');
+                        if (license.totalUsers > 5) {
+                            usersText += `\n... and ${license.totalUsers - 5} more users`;
+                        }
+                    }
+
+                    // Format staff members
+                    let staffText = 'None';
+                    if (license.totalStaff > 0) {
+                        staffText = license.staffMembers
+                            .slice(0, 3) // Limit to 3 staff per license in overview
+                            .map(staff => 
+                                `• ${staff.user_tag} (${staff.role_type})`
+                            )
+                            .join('\n');
+                        if (license.totalStaff > 3) {
+                            staffText += `\n... and ${license.totalStaff - 3} more staff`;
+                        }
+                    }
+
+                    const licenseField = {
+                        name: `🔑 ${license.licenseKey} ${license.isPaused ? '⏸️' : '✅'}`,
+                        value: `**Owner:** ${license.ownerTag}\n` +
+                               `**Status:** ${license.isPaused ? 'PAUSED' : 'ACTIVE'}\n` +
+                               `**Users:** ${license.totalUsers} (${license.totalAuthorizations} auths)\n` +
+                               `**Staff:** ${license.totalStaff}\n` +
+                               `**Authorized Users:**\n${usersText}\n` +
+                               `**Staff Members:**\n${staffText}`,
+                        inline: false
+                    };
+
+                    // Check if we need to start a new embed
+                    if (fieldCount >= maxFieldsPerEmbed) {
+                        embeds.push(currentEmbed);
+                        currentEmbed = new EmbedBuilder()
+                            .setTitle('📊 All Licenses Overview (Continued)')
+                            .setColor(0x0099ff)
+                            .setTimestamp();
+                        fieldCount = 0;
+                    }
+
+                    currentEmbed.addFields(licenseField);
+                    fieldCount++;
+                }
+
+                // Add the last embed
+                embeds.push(currentEmbed);
+
+                // Add summary to the first embed
+                const totalUsers = allLicenses.reduce((sum, license) => sum + license.totalUsers, 0);
+                const totalAuthorizations = allLicenses.reduce((sum, license) => sum + license.totalAuthorizations, 0);
+                const totalStaff = allLicenses.reduce((sum, license) => sum + license.totalStaff, 0);
+                const pausedLicenses = allLicenses.filter(license => license.isPaused).length;
+
+                embeds[0].addFields({
+                    name: '📈 System Summary',
+                    value: `**Total Licenses:** ${allLicenses.length}\n` +
+                           `**Paused Licenses:** ${pausedLicenses}\n` +
+                           `**Total Users:** ${totalUsers}\n` +
+                           `**Total Authorizations:** ${totalAuthorizations}\n` +
+                           `**Total Staff:** ${totalStaff}`,
+                    inline: false
+                });
+
+                // Send all embeds
+                for (let i = 0; i < embeds.length; i++) {
+                    if (i === 0) {
+                        await interaction.editReply({ embeds: [embeds[i]] });
+                    } else {
+                        await interaction.followUp({ embeds: [embeds[i]] });
+                    }
+                }
                 break;
         }
     } catch (error) {
