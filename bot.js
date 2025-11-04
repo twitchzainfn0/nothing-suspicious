@@ -1392,9 +1392,9 @@ client.on('interactionCreate', async interaction => {
                 // Defer the reply since this might take some time
                 await interaction.deferReply();
 
-                const allLicenses = await getAllLicensesWithDetails();
+                const allLicensesData = await getAllLicensesWithDetails();
                 
-                if (allLicenses.length === 0) {
+                if (allLicensesData.length === 0) {
                     return interaction.editReply({ content: 'No licenses found in the system!', ephemeral: true });
                 }
 
@@ -1403,13 +1403,13 @@ client.on('interactionCreate', async interaction => {
                 let currentEmbed = new EmbedBuilder()
                     .setTitle('📊 All Licenses Overview')
                     .setColor(0x0099ff)
-                    .setDescription(`Total Licenses: ${allLicenses.length}\n\nShowing all license owners with their authorized users and staff members.`)
+                    .setDescription(`Total Licenses: ${allLicensesData.length}\n\nShowing all license owners with their authorized users and staff members.`)
                     .setTimestamp();
 
                 let fieldCount = 0;
                 const maxFieldsPerEmbed = 25; // Discord limit
 
-                for (const license of allLicenses) {
+                for (const license of allLicensesData) {
                     // Format authorized users
                     let usersText = 'None';
                     if (license.totalUsers > 0) {
@@ -1467,18 +1467,18 @@ client.on('interactionCreate', async interaction => {
                 embeds.push(currentEmbed);
 
                 // Add summary to the first embed
-                const totalUsers = allLicenses.reduce((sum, license) => sum + license.totalUsers, 0);
-                const totalAuthorizations = allLicenses.reduce((sum, license) => sum + license.totalAuthorizations, 0);
-                const totalStaff = allLicenses.reduce((sum, license) => sum + license.totalStaff, 0);
-                const pausedLicenses = allLicenses.filter(license => license.isPaused).length;
+                const systemTotalUsers = allLicensesData.reduce((sum, license) => sum + license.totalUsers, 0);
+                const systemTotalAuthorizations = allLicensesData.reduce((sum, license) => sum + license.totalAuthorizations, 0);
+                const systemTotalStaff = allLicensesData.reduce((sum, license) => sum + license.totalStaff, 0);
+                const systemPausedLicenses = allLicensesData.filter(license => license.isPaused).length;
 
                 embeds[0].addFields({
                     name: '📈 System Summary',
-                    value: `**Total Licenses:** ${allLicenses.length}\n` +
-                           `**Paused Licenses:** ${pausedLicenses}\n` +
-                           `**Total Users:** ${totalUsers}\n` +
-                           `**Total Authorizations:** ${totalAuthorizations}\n` +
-                           `**Total Staff:** ${totalStaff}`,
+                    value: `**Total Licenses:** ${allLicensesData.length}\n` +
+                           `**Paused Licenses:** ${systemPausedLicenses}\n` +
+                           `**Total Users:** ${systemTotalUsers}\n` +
+                           `**Total Authorizations:** ${systemTotalAuthorizations}\n` +
+                           `**Total Staff:** ${systemTotalStaff}`,
                     inline: false
                 });
 
@@ -1544,3 +1544,4 @@ client.login(process.env.DISCORD_TOKEN)
         logger.error(`Bot login failed: ${error.message}`);
         process.exit(1);
     });
+
