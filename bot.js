@@ -16,6 +16,12 @@ const pool = new Pool({
 // Special value for "all vehicles" authorization
 const ALL_VEHICLES = '*ALL*';
 
+// Role types for license management
+const ROLE_TYPES = {
+    ADMIN: 'admin',
+    HELPER: 'helper'
+};
+
 // Initialize database tables
 async function initializeDatabase() {
     try {
@@ -48,6 +54,20 @@ async function initializeDatabase() {
                 owner_id VARCHAR(255) NOT NULL,
                 owner_tag VARCHAR(255) NOT NULL,
                 paused_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
+
+        // Create license_admins table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS license_admins (
+                id SERIAL PRIMARY KEY,
+                license_key VARCHAR(255) REFERENCES licenses(license_key) ON DELETE CASCADE,
+                user_id VARCHAR(255) NOT NULL,
+                user_tag VARCHAR(255) NOT NULL,
+                role_type VARCHAR(50) NOT NULL,
+                added_by VARCHAR(255) NOT NULL,
+                added_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(license_key, user_id)
             )
         `);
 
@@ -348,6 +368,144 @@ async function getLicenseInfo(userId) {
     }
 }
 
+// Admin/Helper management functions
+async function addLicenseStaff(licenseKey, staffUserId, staffUserTag, roleType, addedByUserId) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // Check if user is already staff for this license
+        const existingCheck = await client.query(
+            'SELECT id FROM license_admins WHERE license_key = $1 AND user_id = $2',
+            [licenseKey, staffUserId]
+        );
+        
+        if (existingCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return { success: false, message: 'User is already staff for this license' };
+        }
+        
+        // Check if user is the license owner
+        const ownerCheck = await client.query(
+            'SELECT owner_id FROM licenses WHERE license_key = $1 AND owner_id = $2',
+            [licenseKey, staffUserId]
+        );
+        
+        if (ownerCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return { success: false, message: 'Cannot add license owner as staff' };
+        }
+        
+        // Add the staff member
+        await client.query(
+            'INSERT INTO license_admins (license_key, user_id, user_tag, role_type, added_by) VALUES ($1, $2, $3, $4, $5)',
+            [licenseKey, staffUserId, staffUserTag, roleType, addedByUserId]
+        );
+        
+        await client.query('COMMIT');
+        
+        logger.info(`Added ${roleType} ${staffUserTag} to license ${licenseKey}`);
+        return { success: true, message: `${roleType.charAt(0).toUpperCase() + roleType.slice(1)} added successfully` };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        logger.error('Error adding license staff:', error);
+        return { success: false, message: 'Error adding staff member' };
+    } finally {
+        client.release();
+    }
+}
+
+async function removeLicenseStaff(licenseKey, staffUserId, removedByUserId) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // Remove the staff member
+        const result = await client.query(
+            'DELETE FROM license_admins WHERE license_key = $1 AND user_id = $2',
+            [licenseKey, staffUserId]
+        );
+        
+        if (result.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return { success: false, message: 'Staff member not found for this license' };
+        }
+        
+        await client.query('COMMIT');
+        
+        logger.info(`Removed staff ${staffUserId} from license ${licenseKey}`);
+        return { success: true, message: 'Staff member removed successfully' };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        logger.error('Error removing license staff:', error);
+        return { success: false, message: 'Error removing staff member' };
+    } finally {
+        client.release();
+    }
+}
+
+async function getLicenseStaff(licenseKey) {
+    try {
+        const result = await pool.query(
+            'SELECT user_id, user_tag, role_type, added_by, added_at FROM license_admins WHERE license_key = $1 ORDER BY role_type, added_at',
+            [licenseKey]
+        );
+        return result.rows;
+    } catch (error) {
+        logger.error('Error getting license staff:', error);
+        return [];
+    }
+}
+
+async function getUserStaffRoles(userId) {
+    try {
+        const result = await pool.query(
+            `SELECT la.license_key, la.role_type, l.owner_tag 
+             FROM license_admins la 
+             JOIN licenses l ON la.license_key = l.license_key 
+             WHERE la.user_id = $1`,
+            [userId]
+        );
+        return result.rows;
+    } catch (error) {
+        logger.error('Error getting user staff roles:', error);
+        return [];
+    }
+}
+
+async function canUserManageLicense(userId, licenseKey, requireAdmin = false) {
+    try {
+        // Check if user is license owner
+        const ownerCheck = await pool.query(
+            'SELECT license_key FROM licenses WHERE license_key = $1 AND owner_id = $2',
+            [licenseKey, userId]
+        );
+        
+        if (ownerCheck.rows.length > 0) {
+            return { canManage: true, isOwner: true, role: 'owner' };
+        }
+        
+        // Check if user is staff for this license
+        const staffCheck = await pool.query(
+            'SELECT role_type FROM license_admins WHERE license_key = $1 AND user_id = $2',
+            [licenseKey, userId]
+        );
+        
+        if (staffCheck.rows.length > 0) {
+            const staffRole = staffCheck.rows[0].role_type;
+            if (requireAdmin && staffRole !== ROLE_TYPES.ADMIN) {
+                return { canManage: false, isOwner: false, role: staffRole };
+            }
+            return { canManage: true, isOwner: false, role: staffRole };
+        }
+        
+        return { canManage: false, isOwner: false, role: null };
+    } catch (error) {
+        logger.error('Error checking license management permissions:', error);
+        return { canManage: false, isOwner: false, role: null };
+    }
+}
+
 // Command definitions
 const commands = [
     new SlashCommandBuilder()
@@ -364,7 +522,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('authorize')
-        .setDescription('Add a user to your approved list (with optional vehicle)')
+        .setDescription('Add a user to approved list')
         .addStringOption(option =>
             option.setName('username')
                 .setDescription('Roblox username to authorize')
@@ -372,11 +530,15 @@ const commands = [
         .addStringOption(option =>
             option.setName('vehicle')
                 .setDescription('Specific vehicle to authorize (leave empty for ALL vehicles)')
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('licensekey')
+                .setDescription('License key to manage (required if you have multiple staff roles)')
                 .setRequired(false)),
 
     new SlashCommandBuilder()
         .setName('deauthorize')
-        .setDescription('Remove a user/vehicle from your approved list')
+        .setDescription('Remove a user/vehicle from approved list')
         .addStringOption(option =>
             option.setName('username')
                 .setDescription('Roblox username to deauthorize')
@@ -384,11 +546,19 @@ const commands = [
         .addStringOption(option =>
             option.setName('vehicle')
                 .setDescription('Specific vehicle to remove (leave empty to remove ALL authorization)')
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('licensekey')
+                .setDescription('License key to manage (required if you have multiple staff roles)')
                 .setRequired(false)),
 
     new SlashCommandBuilder()
         .setName('authorized')
-        .setDescription('List all authorized users and their vehicles'),
+        .setDescription('List all authorized users and their vehicles')
+        .addStringOption(option =>
+            option.setName('licensekey')
+                .setDescription('License key to view (required if you have multiple staff roles)')
+                .setRequired(false)),
 
     new SlashCommandBuilder()
         .setName('mylicense')
@@ -436,7 +606,39 @@ const commands = [
         .addUserOption(option =>
             option.setName('to')
                 .setDescription('New license owner')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('addstaff')
+        .setDescription('Add an admin or helper to manage your license')
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('User to add as staff')
                 .setRequired(true))
+        .addStringOption(option =>
+            option.setName('role')
+                .setDescription('Staff role type')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Admin (can add/remove users)', value: ROLE_TYPES.ADMIN },
+                    { name: 'Helper (can only add users)', value: ROLE_TYPES.HELPER }
+                )),
+
+    new SlashCommandBuilder()
+        .setName('removestaff')
+        .setDescription('Remove a staff member from your license')
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('Staff member to remove')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('staff')
+        .setDescription('List all staff members for your license'),
+
+    new SlashCommandBuilder()
+        .setName('mystaff')
+        .setDescription('Show licenses where you are staff')
 ];
 
 client.once('ready', async () => {
@@ -508,17 +710,57 @@ client.on('interactionCreate', async interaction => {
                 break;
 
             case 'authorize':
-                const userLicense = await getUserLicense(user.id);
-                if (!userLicense) {
-                    logger.warn(`User ${user.tag} attempted to authorize without a license`);
-                    return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
+                let userLicense = await getUserLicense(user.id);
+                const specifiedLicenseKey = interaction.options.getString('licensekey');
+                
+                // If user specified a license key, use that
+                if (specifiedLicenseKey) {
+                    // Check if user has permission to manage the specified license
+                    const permissionCheck = await canUserManageLicense(user.id, specifiedLicenseKey, false);
+                    if (!permissionCheck.canManage) {
+                        logger.warn(`User ${user.tag} attempted to authorize license ${specifiedLicenseKey} without permission`);
+                        return interaction.reply({ content: 'You don\'t have permission to manage this license!', ephemeral: true });
+                    }
+                    userLicense = specifiedLicenseKey;
+                } else {
+                    // No license key specified - use user's own license or check staff roles
+                    if (!userLicense) {
+                        // Check if user is staff for any license
+                        const staffRoles = await getUserStaffRoles(user.id);
+                        if (staffRoles.length === 0) {
+                            logger.warn(`User ${user.tag} attempted to authorize without a license or staff role`);
+                            return interaction.reply({ content: 'You don\'t have a license or staff permissions!', ephemeral: true });
+                        }
+                        
+                        // If user has multiple staff roles, require license key
+                        if (staffRoles.length > 1) {
+                            const licenseList = staffRoles.map(role => 
+                                `• **${role.license_key}** (${role.role_type} for ${role.owner_tag})`
+                            ).join('\n');
+                            
+                            return interaction.reply({ 
+                                content: `You have staff access to multiple licenses. Please specify which license to use with the \`licensekey\` option.\n\nYour staff roles:\n${licenseList}`, 
+                                ephemeral: true 
+                            });
+                        }
+                        
+                        // Use the first (and only) license they have access to
+                        userLicense = staffRoles[0].license_key;
+                    }
+                }
+
+                // Final permission check
+                const authPermission = await canUserManageLicense(user.id, userLicense, false);
+                if (!authPermission.canManage) {
+                    logger.warn(`User ${user.tag} attempted to authorize without permission for license ${userLicense}`);
+                    return interaction.reply({ content: 'You don\'t have permission to manage this license!', ephemeral: true });
                 }
 
                 // Check if license is paused
                 const isPausedAuth = await isLicensePaused(userLicense);
                 if (isPausedAuth) {
                     logger.warn(`User ${user.tag} attempted to authorize with paused license ${userLicense}`);
-                    return interaction.reply({ content: 'Your license is currently paused. Contact the bot owner.', ephemeral: true });
+                    return interaction.reply({ content: 'This license is currently paused. Contact the bot owner.', ephemeral: true });
                 }
 
                 const usernameToAdd = interaction.options.getString('username');
@@ -527,13 +769,15 @@ client.on('interactionCreate', async interaction => {
                 const addResult = await addUserToLicense(userLicense, usernameToAdd, vehicleToAdd);
 
                 if (addResult.success) {
+                    const roleInfo = authPermission.isOwner ? 'Owner' : authPermission.role.charAt(0).toUpperCase() + authPermission.role.slice(1);
                     const embed = new EmbedBuilder()
                         .setTitle('User Authorized')
                         .setColor(0x00ff00)
                         .addFields(
                             { name: 'Username', value: usernameToAdd, inline: true },
                             { name: 'Authorization', value: addResult.forAllVehicles ? 'ALL Vehicles' : `Vehicle: ${vehicleToAdd}`, inline: true },
-                            { name: 'License', value: userLicense, inline: true }
+                            { name: 'License', value: userLicense, inline: true },
+                            { name: 'Added By', value: `${user.tag} (${roleInfo})`, inline: true }
                         );
                     await interaction.reply({ embeds: [embed] });
                 } else {
@@ -542,17 +786,63 @@ client.on('interactionCreate', async interaction => {
                 break;
 
             case 'deauthorize':
-                const userLicense2 = await getUserLicense(user.id);
-                if (!userLicense2) {
-                    logger.warn(`User ${user.tag} attempted to deauthorize without a license`);
-                    return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
+                let userLicense2 = await getUserLicense(user.id);
+                const specifiedLicenseKey2 = interaction.options.getString('licensekey');
+                
+                // If user specified a license key, use that
+                if (specifiedLicenseKey2) {
+                    // Check if user has permission to manage the specified license (require admin for deauthorization)
+                    const permissionCheck = await canUserManageLicense(user.id, specifiedLicenseKey2, true);
+                    if (!permissionCheck.canManage) {
+                        const roleMessage = permissionCheck.role === ROLE_TYPES.HELPER ? 
+                            'Helpers can only add users, not remove them. Ask an admin or license owner.' : 
+                            'You don\'t have permission to manage this license!';
+                        logger.warn(`User ${user.tag} attempted to deauthorize license ${specifiedLicenseKey2} without permission`);
+                        return interaction.reply({ content: roleMessage, ephemeral: true });
+                    }
+                    userLicense2 = specifiedLicenseKey2;
+                } else {
+                    // No license key specified - use user's own license or check staff roles
+                    if (!userLicense2) {
+                        // Check if user is staff for any license
+                        const staffRoles = await getUserStaffRoles(user.id);
+                        if (staffRoles.length === 0) {
+                            logger.warn(`User ${user.tag} attempted to deauthorize without a license or staff role`);
+                            return interaction.reply({ content: 'You don\'t have a license or staff permissions!', ephemeral: true });
+                        }
+                        
+                        // If user has multiple staff roles, require license key
+                        if (staffRoles.length > 1) {
+                            const licenseList = staffRoles.map(role => 
+                                `• **${role.license_key}** (${role.role_type} for ${role.owner_tag})`
+                            ).join('\n');
+                            
+                            return interaction.reply({ 
+                                content: `You have staff access to multiple licenses. Please specify which license to use with the \`licensekey\` option.\n\nYour staff roles:\n${licenseList}`, 
+                                ephemeral: true 
+                            });
+                        }
+                        
+                        // Use the first (and only) license they have access to
+                        userLicense2 = staffRoles[0].license_key;
+                    }
+                }
+
+                // Final permission check (require admin role for deauthorization)
+                const deauthPermission = await canUserManageLicense(user.id, userLicense2, true);
+                if (!deauthPermission.canManage) {
+                    const roleMessage = deauthPermission.role === ROLE_TYPES.HELPER ? 
+                        'Helpers can only add users, not remove them. Ask an admin or license owner.' : 
+                        'You don\'t have permission to manage this license!';
+                    logger.warn(`User ${user.tag} attempted to deauthorize without permission for license ${userLicense2}`);
+                    return interaction.reply({ content: roleMessage, ephemeral: true });
                 }
 
                 // Check if license is paused
                 const isPausedDeauth = await isLicensePaused(userLicense2);
                 if (isPausedDeauth) {
                     logger.warn(`User ${user.tag} attempted to deauthorize with paused license ${userLicense2}`);
-                    return interaction.reply({ content: 'Your license is currently paused. Contact the bot owner.', ephemeral: true });
+                    return interaction.reply({ content: 'This license is currently paused. Contact the bot owner.', ephemeral: true });
                 }
 
                 const usernameToRemove = interaction.options.getString('username');
@@ -562,13 +852,15 @@ client.on('interactionCreate', async interaction => {
 
                 if (removeSuccess) {
                     const action = vehicleToRemove ? `vehicle ${vehicleToRemove}` : 'ALL authorization';
+                    const roleInfo = deauthPermission.isOwner ? 'Owner' : deauthPermission.role.charAt(0).toUpperCase() + deauthPermission.role.slice(1);
                     const embed = new EmbedBuilder()
                         .setTitle('User Deauthorized')
                         .setColor(0xff0000)
                         .addFields(
                             { name: 'Username', value: usernameToRemove, inline: true },
                             { name: 'Action', value: `Removed ${action}`, inline: true },
-                            { name: 'License', value: userLicense2, inline: true }
+                            { name: 'License', value: userLicense2, inline: true },
+                            { name: 'Removed By', value: `${user.tag} (${roleInfo})`, inline: true }
                         );
                     await interaction.reply({ embeds: [embed] });
                 } else {
@@ -577,10 +869,50 @@ client.on('interactionCreate', async interaction => {
                 break;
 
             case 'authorized':
-                const userLicense3 = await getUserLicense(user.id);
-                if (!userLicense3) {
-                    logger.warn(`User ${user.tag} attempted to view authorized users without a license`);
-                    return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
+                let userLicense3 = await getUserLicense(user.id);
+                const specifiedLicenseKey3 = interaction.options.getString('licensekey');
+                
+                // If user specified a license key, use that
+                if (specifiedLicenseKey3) {
+                    // Check if user has permission to view the specified license
+                    const permissionCheck = await canUserManageLicense(user.id, specifiedLicenseKey3, false);
+                    if (!permissionCheck.canManage) {
+                        logger.warn(`User ${user.tag} attempted to view license ${specifiedLicenseKey3} without permission`);
+                        return interaction.reply({ content: 'You don\'t have permission to view this license!', ephemeral: true });
+                    }
+                    userLicense3 = specifiedLicenseKey3;
+                } else {
+                    // No license key specified - use user's own license or check staff roles
+                    if (!userLicense3) {
+                        // Check if user is staff for any license
+                        const staffRoles = await getUserStaffRoles(user.id);
+                        if (staffRoles.length === 0) {
+                            logger.warn(`User ${user.tag} attempted to view authorized users without a license or staff role`);
+                            return interaction.reply({ content: 'You don\'t have a license or staff permissions!', ephemeral: true });
+                        }
+                        
+                        // If user has multiple staff roles, require license key
+                        if (staffRoles.length > 1) {
+                            const licenseList = staffRoles.map(role => 
+                                `• **${role.license_key}** (${role.role_type} for ${role.owner_tag})`
+                            ).join('\n');
+                            
+                            return interaction.reply({ 
+                                content: `You have staff access to multiple licenses. Please specify which license to view with the \`licensekey\` option.\n\nYour staff roles:\n${licenseList}`, 
+                                ephemeral: true 
+                            });
+                        }
+                        
+                        // Use the first (and only) license they have access to
+                        userLicense3 = staffRoles[0].license_key;
+                    }
+                }
+
+                // Final permission check
+                const viewPermission = await canUserManageLicense(user.id, userLicense3, false);
+                if (!viewPermission.canManage) {
+                    logger.warn(`User ${user.tag} attempted to view authorized users without permission for license ${userLicense3}`);
+                    return interaction.reply({ content: 'You don\'t have permission to view this license!', ephemeral: true });
                 }
 
                 // Check if license is paused
@@ -607,12 +939,14 @@ client.on('interactionCreate', async interaction => {
                 const totalUsers = Object.keys(userVehicles).length;
                 const totalAuthorizations = authorizedUsers.length;
 
+                const roleInfo = viewPermission.isOwner ? 'Owner' : viewPermission.role.charAt(0).toUpperCase() + viewPermission.role.slice(1);
                 const embed = new EmbedBuilder()
                     .setTitle('Authorized Users')
                     .setColor(isPausedView ? 0xff9900 : 0x0099ff)
                     .addFields(
                         { name: 'License', value: userLicense3, inline: true },
                         { name: 'Status', value: isPausedView ? '⏸️ PAUSED' : '✅ ACTIVE', inline: true },
+                        { name: 'Your Role', value: roleInfo, inline: true },
                         { name: 'Total Users', value: totalUsers.toString(), inline: true },
                         { name: 'Total Authorizations', value: totalAuthorizations.toString(), inline: true },
                         { name: 'Users & Vehicles', value: userList, inline: false }
@@ -624,8 +958,28 @@ client.on('interactionCreate', async interaction => {
             case 'mylicense':
                 const myLicense = await getUserLicense(user.id);
                 if (!myLicense) {
-                    logger.warn(`User ${user.tag} attempted to view license info without a license`);
-                    return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
+                    // Check if user is staff for any licenses
+                    const staffRoles = await getUserStaffRoles(user.id);
+                    if (staffRoles.length === 0) {
+                        logger.warn(`User ${user.tag} attempted to view license info without a license`);
+                        return interaction.reply({ content: 'You don\'t have a license! Contact the bot owner.', ephemeral: true });
+                    }
+                    
+                    // Show staff roles instead
+                    const staffList = staffRoles.map(role => 
+                        `• **${role.license_key}**\n  Role: ${role.role_type}\n  Owner: ${role.owner_tag}`
+                    ).join('\n\n');
+                    
+                    const staffEmbed = new EmbedBuilder()
+                        .setTitle('Your Staff Roles')
+                        .setColor(0x0099ff)
+                        .setDescription(`You don't own a license but have staff access to:\n\n${staffList}`)
+                        .addFields(
+                            { name: 'Admin Permissions', value: '• Add users\n• Remove users\n• View authorized users', inline: true },
+                            { name: 'Helper Permissions', value: '• Add users\n• View authorized users', inline: true }
+                        );
+                    
+                    return interaction.reply({ embeds: [staffEmbed], ephemeral: true });
                 }
 
                 // Check if license is paused
@@ -634,6 +988,11 @@ client.on('interactionCreate', async interaction => {
                 const myUserCount = new Set(myUsers.map(u => u.username)).size;
                 const myAuthorizationCount = myUsers.length;
 
+                // Get staff members for this license
+                const staffMembers = await getLicenseStaff(myLicense);
+                const adminCount = staffMembers.filter(s => s.role_type === ROLE_TYPES.ADMIN).length;
+                const helperCount = staffMembers.filter(s => s.role_type === ROLE_TYPES.HELPER).length;
+
                 const embed4 = new EmbedBuilder()
                     .setTitle('Your License Information')
                     .setColor(isPausedMy ? 0xff9900 : 0x0099ff)
@@ -641,7 +1000,8 @@ client.on('interactionCreate', async interaction => {
                         { name: 'License Key', value: myLicense, inline: true },
                         { name: 'Status', value: isPausedMy ? '⏸️ PAUSED' : '✅ ACTIVE', inline: true },
                         { name: 'Authorized Users', value: myUserCount.toString(), inline: true },
-                        { name: 'Total Authorizations', value: myAuthorizationCount.toString(), inline: true }
+                        { name: 'Total Authorizations', value: myAuthorizationCount.toString(), inline: true },
+                        { name: 'Staff Members', value: `Admins: ${adminCount}\nHelpers: ${helperCount}`, inline: true }
                     );
 
                 await interaction.reply({ embeds: [embed4], ephemeral: true });
@@ -844,6 +1204,111 @@ client.on('interactionCreate', async interaction => {
                 } finally {
                     dbClient.release();
                 }
+                break;
+
+            case 'addstaff':
+                const userLicense4 = await getUserLicense(user.id);
+                if (!userLicense4) {
+                    logger.warn(`User ${user.tag} attempted to add staff without a license`);
+                    return interaction.reply({ content: 'You don\'t have a license!', ephemeral: true });
+                }
+
+                const staffUserToAdd = interaction.options.getUser('user');
+                const staffRole = interaction.options.getString('role');
+
+                const addStaffResult = await addLicenseStaff(userLicense4, staffUserToAdd.id, staffUserToAdd.tag, staffRole, user.id);
+
+                if (addStaffResult.success) {
+                    const embed = new EmbedBuilder()
+                        .setTitle('Staff Member Added')
+                        .setColor(0x00ff00)
+                        .addFields(
+                            { name: 'User', value: staffUserToAdd.tag, inline: true },
+                            { name: 'Role', value: staffRole.charAt(0).toUpperCase() + staffRole.slice(1), inline: true },
+                            { name: 'License', value: userLicense4, inline: true }
+                        );
+                    await interaction.reply({ embeds: [embed] });
+                } else {
+                    await interaction.reply({ content: addStaffResult.message || 'Failed to add staff member!', ephemeral: true });
+                }
+                break;
+
+            case 'removestaff':
+                const userLicense5 = await getUserLicense(user.id);
+                if (!userLicense5) {
+                    logger.warn(`User ${user.tag} attempted to remove staff without a license`);
+                    return interaction.reply({ content: 'You don\'t have a license!', ephemeral: true });
+                }
+
+                const staffUserToRemove = interaction.options.getUser('user');
+
+                const removeStaffResult = await removeLicenseStaff(userLicense5, staffUserToRemove.id, user.id);
+
+                if (removeStaffResult.success) {
+                    const embed = new EmbedBuilder()
+                        .setTitle('Staff Member Removed')
+                        .setColor(0xff0000)
+                        .addFields(
+                            { name: 'User', value: staffUserToRemove.tag, inline: true },
+                            { name: 'License', value: userLicense5, inline: true }
+                        );
+                    await interaction.reply({ embeds: [embed] });
+                } else {
+                    await interaction.reply({ content: removeStaffResult.message || 'Failed to remove staff member!', ephemeral: true });
+                }
+                break;
+
+            case 'staff':
+                const userLicense6 = await getUserLicense(user.id);
+                if (!userLicense6) {
+                    logger.warn(`User ${user.tag} attempted to view staff without a license`);
+                    return interaction.reply({ content: 'You don\'t have a license!', ephemeral: true });
+                }
+
+                const staffMembersList = await getLicenseStaff(userLicense6);
+                
+                let staffList = 'None';
+                if (staffMembersList.length > 0) {
+                    staffList = staffMembersList.map(staff => 
+                        `• **${staff.user_tag}** (${staff.role_type})\n  Added by: ${staff.added_by}\n  Added: ${new Date(staff.added_at).toLocaleDateString()}`
+                    ).join('\n\n');
+                }
+
+                const staffEmbed = new EmbedBuilder()
+                    .setTitle('License Staff Members')
+                    .setColor(0x0099ff)
+                    .addFields(
+                        { name: 'License', value: userLicense6, inline: true },
+                        { name: 'Total Staff', value: staffMembersList.length.toString(), inline: true },
+                        { name: 'Staff List', value: staffList, inline: false }
+                    )
+                    .addFields(
+                        { name: 'Role Permissions', value: '**Admin**: Can add/remove users\n**Helper**: Can only add users', inline: false }
+                    );
+
+                await interaction.reply({ embeds: [staffEmbed] });
+                break;
+
+            case 'mystaff':
+                const staffRoles = await getUserStaffRoles(user.id);
+                if (staffRoles.length === 0) {
+                    return interaction.reply({ content: 'You are not a staff member for any licenses.', ephemeral: true });
+                }
+
+                const staffRoleList = staffRoles.map(role => 
+                    `• **${role.license_key}**\n  Role: ${role.role_type}\n  Owner: ${role.owner_tag}`
+                ).join('\n\n');
+
+                const myStaffEmbed = new EmbedBuilder()
+                    .setTitle('Your Staff Roles')
+                    .setColor(0x0099ff)
+                    .setDescription(`You are staff for the following licenses:\n\n${staffRoleList}`)
+                    .addFields(
+                        { name: 'Admin Permissions', value: '• Add users\n• Remove users\n• View authorized users', inline: true },
+                        { name: 'Helper Permissions', value: '• Add users\n• View authorized users', inline: true }
+                    );
+
+                await interaction.reply({ embeds: [myStaffEmbed], ephemeral: true });
                 break;
         }
     } catch (error) {
